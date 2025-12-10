@@ -1,0 +1,799 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<title>PDF 分割 · 左右实时预览</title>
+<style>
+  body {
+    margin: 0;
+    font-family: system-ui, -apple-system, BlinkMacSystemFont;
+    background: #f5f5f7;
+    display: flex;
+    flex-direction: column;
+    height: 100vh;
+  }
+
+  header {
+    padding: 10px 16px;
+    background: #fff;
+    box-shadow: 0 1px 3px rgba(0,0,0,0.1);
+    z-index: 10;
+  }
+
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    align-items: center;
+    gap: 8px;
+    font-size: 13px;
+  }
+
+  input[type="file"] { cursor: pointer; }
+  select, button, input[type="number"] {
+    padding: 3px 6px;
+    font-size: 13px;
+  }
+
+  #fileInfo {
+    color: #666;
+    min-width: 140px;
+  }
+
+  .main-container {
+    flex: 1;
+    display: flex;
+    min-height: 0;
+  }
+
+  .pane {
+    flex: 1;
+    display: flex;
+    flex-direction: column;
+    min-width: 0;
+  }
+
+  .pane-header {
+    padding: 6px 10px;
+    font-weight: 600;
+    font-size: 13px;
+    background: #f0f0f5;
+    border-bottom: 1px solid #ddd;
+  }
+
+  .pane-body {
+    flex: 1;
+    position: relative;
+    min-height: 300px;
+  }
+
+  .splitter {
+    width: 3px;
+    background: #ddd;
+  }
+
+  /* 左侧 viewer + 分割线 */
+  .viewer-wrapper {
+    position: absolute;
+    inset: 0;
+    border-right: 1px solid #ddd;
+    background: #fff;
+  }
+
+  #pdfViewer, #splitPreview {
+    width: 100%;
+    height: 100%;
+    border: none;
+  }
+
+  .cut-line {
+    position: absolute;
+    background: red;
+    z-index: 999;
+    cursor: move;
+  }
+  .horizontal-line { height: 2px; width: 100%; }
+  .vertical-line   { width: 2px; height: 100%; }
+
+  .auto-page-line.horizontal-line {
+    background: transparent;
+    border-top: 2px dashed red;
+    height: 0;
+    width: 100%;
+  }
+  .auto-page-line.vertical-line {
+    background: transparent;
+    border-left: 2px dashed red;
+    width: 0;
+    height: 100%;
+  }
+
+  .selected-line {
+    box-shadow: 0 0 0 2px rgba(0,128,255,0.8);
+  }
+
+  .segment-selection {
+    display: flex;
+    align-items: center;
+    flex-wrap: wrap;
+    gap: 4px;
+    font-size: 12px;
+  }
+
+  .segment-list label {
+    margin-right: 4px;
+    white-space: nowrap;
+  }
+
+  .segment-list input[type="checkbox"] {
+    margin-right: 2px;
+  }
+
+  .micro-adjust {
+    display: flex;
+    align-items: center;
+    gap: 4px;
+  }
+
+  .hidden {
+    display: none !important;
+  }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="controls">
+    <!-- 上传 PDF -->
+    <input id="pdfInput" type="file" accept="application/pdf" />
+    <span id="fileInfo">请选择 PDF 文件。</span>
+    <!-- 自动等分 -->
+    <select id="autoSplitOrientation">
+      <option value="vertical-line">竖线等分（左右多段）</option>
+      <option value="horizontal-line">横线等分（上下多段）</option>
+    </select>
+    <label>
+      分成
+      <input id="autoSplitCount" type="number" min="2" max="10" value="2" style="width:48px;">
+      段
+    </label>
+    <button id="autoSplitBtn">自动等分</button>
+    <button id="clearAutoSplitBtn">清除自动线</button>
+    <button id="trimAreasBtn" disabled>去除多余区域</button>
+    <div class="micro-adjust">
+      <span>微调:</span>
+      <button id="moveUpBtn"   class="hidden">上移</button>
+      <button id="moveDownBtn" class="hidden">下移</button>
+      <button id="moveLeftBtn">左移</button>
+      <button id="moveRightBtn">右移</button>
+    </div>
+    <div class="segment-selection">
+      <span id="segmentHint">删除区域：</span>
+      <div id="segmentList" class="segment-list">暂无可删除区域</div>
+    </div>
+
+    <!-- 导出当前预览 -->
+    <button id="downloadBtn">下载当前预览 PDF</button>
+  </div>
+</header>
+
+<div class="main-container">
+  <!-- 左侧：原 PDF + 分割线 -->
+  <div class="pane">
+    <div class="pane-header">原始 PDF（可添加分割线）</div>
+    <div class="pane-body">
+      <div class="viewer-wrapper" id="viewerWrapper">
+        <iframe id="pdfViewer"></iframe>
+      </div>
+    </div>
+  </div>
+
+  <div class="splitter"></div>
+
+  <!-- 右侧：切割后 PDF 预览 -->
+  <div class="pane">
+    <div class="pane-header">分割后 PDF 实时预览</div>
+    <div class="pane-body">
+      <iframe id="splitPreview"></iframe>
+    </div>
+  </div>
+</div>
+
+<!-- pdf-lib -->
+<script src="https://unpkg.com/pdf-lib@1.17.1/dist/pdf-lib.min.js"></script>
+
+<script>
+(function () {
+  const pdfInput = document.getElementById("pdfInput");
+  const pdfViewer = document.getElementById("pdfViewer");
+  const viewerWrapper = document.getElementById("viewerWrapper");
+  const fileInfo = document.getElementById("fileInfo");
+
+  const autoSplitOrientation = document.getElementById("autoSplitOrientation");
+  const autoSplitCount = document.getElementById("autoSplitCount");
+  const autoSplitBtn = document.getElementById("autoSplitBtn");
+  const clearAutoSplitBtn = document.getElementById("clearAutoSplitBtn");
+  const moveUpBtn = document.getElementById("moveUpBtn");
+  const moveDownBtn = document.getElementById("moveDownBtn");
+  const moveLeftBtn = document.getElementById("moveLeftBtn");
+  const moveRightBtn = document.getElementById("moveRightBtn");
+  const trimAreasBtn = document.getElementById("trimAreasBtn");
+  const segmentList = document.getElementById("segmentList");
+  const segmentHint = document.getElementById("segmentHint");
+
+  const splitPreview = document.getElementById("splitPreview");
+  const downloadBtn = document.getElementById("downloadBtn");
+
+  let currentFile = null;
+  let currentPdfBytes = null;   // ArrayBuffer
+  let srcDoc = null;            // PDFLib.PDFDocument
+  let currentObjectURL = null;  // 左侧原始 PDF 预览
+  let lastPreviewUrl = null;    // 右侧预览的 object URL
+
+  let selectedLine = null;
+  const MOVE_STEP = 10;
+
+  let previewUpdateTimer = null;
+  let lastDomType = null;
+  let lastDomSegments = [];
+  const rotationEdgeMaps = {
+    0:   { left: "left",   right: "right",  top: "top",    bottom: "bottom" },
+    90:  { left: "bottom", right: "top",    top: "left",   bottom: "right"  },
+    180: { left: "right",  right: "left",   top: "bottom", bottom: "top"    },
+    270: { left: "top",    right: "bottom", top: "right",  bottom: "left"   }
+  };
+
+  function clamp01(value) {
+    if (!Number.isFinite(value)) return 0;
+    return Math.min(1, Math.max(0, value));
+  }
+
+  function normalizeRotation(angle) {
+    if (!Number.isFinite(angle)) return 0;
+    const normalized = ((Math.round(angle) % 360) + 360) % 360;
+    return normalized === 90 || normalized === 180 || normalized === 270 ? normalized : 0;
+  }
+
+  function resetSegmentOptions() {
+    lastDomSegments = [];
+    lastDomType = null;
+    segmentHint.textContent = "删除区域：";
+    segmentList.textContent = "暂无可删除区域";
+    trimAreasBtn.disabled = true;
+  }
+
+  function renderSegmentOptions(domType, segments) {
+    if (!segments || segments.length === 0) {
+      resetSegmentOptions();
+      return;
+    }
+    segmentHint.textContent = domType === "vertical"
+      ? "删除区域（从左到右编号）："
+      : "删除区域（从上到下编号）：";
+    segmentList.innerHTML = "";
+    segments.forEach((seg, idx) => {
+      const label = document.createElement("label");
+      const checkbox = document.createElement("input");
+      checkbox.type = "checkbox";
+      checkbox.value = idx;
+      label.appendChild(checkbox);
+      label.appendChild(document.createTextNode(`区域${idx + 1}`));
+      segmentList.appendChild(label);
+    });
+    trimAreasBtn.disabled = false;
+  }
+
+  function updateMicroAdjustVisibility() {
+    const orient = autoSplitOrientation.value;
+    const isVertical = orient === "vertical-line";
+    moveLeftBtn.classList.toggle("hidden", !isVertical);
+    moveRightBtn.classList.toggle("hidden", !isVertical);
+    moveUpBtn.classList.toggle("hidden", isVertical);
+    moveDownBtn.classList.toggle("hidden", isVertical);
+  }
+
+  function mapDomRatioToAxis(domType, ratio, edgeMap) {
+    const r = clamp01(ratio);
+    if (domType === "vertical") {
+      const startEdge = edgeMap.left;
+      if (startEdge === "left") return { axis: "x", value: r };
+      if (startEdge === "right") return { axis: "x", value: 1 - r };
+      if (startEdge === "bottom") return { axis: "y", value: r };
+      if (startEdge === "top") return { axis: "y", value: 1 - r };
+    } else {
+      const startEdge = edgeMap.top;
+      if (startEdge === "bottom") return { axis: "y", value: r };
+      if (startEdge === "top") return { axis: "y", value: 1 - r };
+      if (startEdge === "left") return { axis: "x", value: r };
+      if (startEdge === "right") return { axis: "x", value: 1 - r };
+    }
+    return null;
+  }
+
+  function buildDomSegments(lines) {
+    const base = lines.map(line => clamp01(line.ratio));
+    const boundaries = Array.from(new Set(base.concat([0, 1]))).sort((a, b) => a - b);
+    const segments = [];
+    for (let i = 0; i < boundaries.length - 1; i++) {
+      const start = boundaries[i];
+      const end = boundaries[i + 1];
+      if (end <= start) continue;
+      segments.push({
+        index: segments.length,
+        startRatio: start,
+        endRatio: end
+      });
+    }
+    return segments;
+  }
+
+  function getSegmentBox(segment, domType, edgeMap, pageSize) {
+    const startMap = mapDomRatioToAxis(domType, segment.startRatio, edgeMap);
+    const endMap = mapDomRatioToAxis(domType, segment.endRatio, edgeMap);
+    if (!startMap || !endMap || startMap.axis !== endMap.axis) {
+      return null;
+    }
+    const axis = startMap.axis;
+    const start = Math.min(startMap.value, endMap.value);
+    const end = Math.max(startMap.value, endMap.value);
+    if (end <= start) return null;
+
+    if (axis === "x") {
+      const left = pageSize.width * start;
+      const right = pageSize.width * end;
+      return {
+        axis,
+        left,
+        right,
+        bottom: 0,
+        top: pageSize.height,
+        width: right - left,
+        height: pageSize.height
+      };
+    }
+
+    const bottom = pageSize.height * start;
+    const top = pageSize.height * end;
+    return {
+      axis,
+      left: 0,
+      right: pageSize.width,
+      bottom,
+      top,
+      width: pageSize.width,
+      height: top - bottom
+    };
+  }
+
+  async function buildSegmentedPdf(domSegments, domType, keepPredicate = () => true) {
+    const outDoc = await PDFLib.PDFDocument.create();
+    const pages = srcDoc.getPages();
+
+    for (let pageIndex = 0; pageIndex < pages.length; pageIndex++) {
+      const page = pages[pageIndex];
+      const pageSize = page.getSize();
+      const rotationObj = page.getRotation();
+      const pageRotation = normalizeRotation((rotationObj?.angle) || 0);
+      const edgeMap = rotationEdgeMaps[pageRotation] || rotationEdgeMaps[0];
+
+      const boxes = [];
+      for (const segment of domSegments) {
+        if (!keepPredicate(segment.index)) continue;
+        const box = getSegmentBox(segment, domType, edgeMap, pageSize);
+        if (!box || box.width <= 0 || box.height <= 0) continue;
+        boxes.push(box);
+      }
+
+      if (boxes.length === 0) {
+        const [embedded] = await outDoc.embedPages([page]);
+        const newPage = outDoc.addPage([pageSize.width, pageSize.height]);
+        newPage.drawPage(embedded, {
+          x: 0,
+          y: 0,
+          width: pageSize.width,
+          height: pageSize.height
+        });
+        if (pageRotation) newPage.setRotation(rotationObj);
+        continue;
+      }
+
+      for (const box of boxes) {
+        const [embedded] = await outDoc.embedPages([page], [{
+          left: box.left,
+          bottom: box.bottom,
+          right: box.right,
+          top: box.top
+        }]);
+
+        const newPage = outDoc.addPage([box.width, box.height]);
+        newPage.drawPage(embedded, {
+          x: 0,
+          y: 0,
+          width: box.width,
+          height: box.height
+        });
+        if (pageRotation) newPage.setRotation(rotationObj);
+      }
+    }
+
+    return outDoc;
+  }
+
+  function rebuildLinesFromSegments(segments, domType) {
+    viewerWrapper.querySelectorAll(".cut-line").forEach(l => l.remove());
+    setSelectedLine(null);
+    if (!segments || segments.length === 0) {
+      resetSegmentOptions();
+      return;
+    }
+    const rect = viewerWrapper.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+    if (!w || !h) return;
+    const boundaries = new Set();
+    segments.forEach(seg => {
+      boundaries.add(clamp01(seg.startRatio));
+      boundaries.add(clamp01(seg.endRatio));
+    });
+    const sorted = Array.from(boundaries).sort((a, b) => a - b).filter(v => v > 0 && v < 1);
+    sorted.forEach(ratio => {
+      const line = document.createElement("div");
+      if (domType === "vertical") {
+        line.classList.add("cut-line", "vertical-line");
+        line.style.left = (w * ratio) + "px";
+        line.style.top = "0";
+        makeLineInteractive(line, false);
+      } else {
+        line.classList.add("cut-line", "horizontal-line");
+        line.style.top = (h * ratio) + "px";
+        line.style.left = "0";
+        makeLineInteractive(line, true);
+      }
+      viewerWrapper.appendChild(line);
+    });
+  }
+
+  /* 选中分割线高亮 */
+  function setSelectedLine(line) {
+    if (selectedLine) selectedLine.classList.remove("selected-line");
+    selectedLine = line;
+    if (selectedLine) selectedLine.classList.add("selected-line");
+  }
+
+  /* 上传 PDF，左侧预览并加载到 pdf-lib */
+  pdfInput.addEventListener("change", async () => {
+    const file = pdfInput.files[0];
+    if (!file) return;
+
+    if (file.type !== "application/pdf") {
+      alert("请选择 PDF 文件");
+      return;
+    }
+
+    currentFile = file;
+    fileInfo.textContent = `已选择：${file.name}`;
+
+    // 左侧 iframe 预览
+    if (currentObjectURL) URL.revokeObjectURL(currentObjectURL);
+    currentObjectURL = URL.createObjectURL(file);
+    pdfViewer.src = currentObjectURL;
+
+    // 供右侧切割使用的 bytes & PDFDocument
+    currentPdfBytes = await file.arrayBuffer();
+    srcDoc = await PDFLib.PDFDocument.load(currentPdfBytes);
+
+    // 清空右侧预览 & 线条
+    splitPreview.src = "";
+    viewerWrapper.querySelectorAll(".cut-line").forEach(l => l.remove());
+    setSelectedLine(null);
+    resetSegmentOptions();
+
+    performAutoSplit(true);
+  });
+
+  /* 分割线交互：拖动 + 点击选中 + 松开后更新预览 */
+  function makeLineInteractive(line, isHorizontal) {
+    let dragging = false;
+
+    line.addEventListener("mousedown", (e) => {
+      dragging = true;
+      setSelectedLine(line);
+      e.preventDefault();
+    });
+
+    line.addEventListener("click", (e) => {
+      setSelectedLine(line);
+      e.stopPropagation();
+    });
+
+    window.addEventListener("mousemove", (e) => {
+      if (!dragging) return;
+      const rect = viewerWrapper.getBoundingClientRect();
+
+      if (isHorizontal) {
+        let y = e.clientY - rect.top;
+        y = Math.max(0, Math.min(rect.height, y));
+        line.style.top = y + "px";
+      } else {
+        let x = e.clientX - rect.left;
+        x = Math.max(0, Math.min(rect.width, x));
+        line.style.left = x + "px";
+      }
+      // 拖动时可以不实时刷新，等 mouseup 统一刷新（省性能）
+    });
+
+    window.addEventListener("mouseup", () => {
+      if (dragging) {
+        dragging = false;
+        schedulePreviewUpdate();
+      }
+    });
+  }
+
+  // 空白区域点击取消选中
+  viewerWrapper.addEventListener("click", () => setSelectedLine(null));
+
+  function performAutoSplit(selectFirstLine = false) {
+    if (!srcDoc) {
+      alert("请先选择 PDF 文件");
+      return false;
+    }
+    const orient = autoSplitOrientation.value;
+    const count = parseInt(autoSplitCount.value, 10);
+    if (!count || count < 2) {
+      alert("段数必须 >= 2");
+      return false;
+    }
+
+    viewerWrapper.querySelectorAll(".auto-page-line").forEach(l => l.remove());
+
+    const rect = viewerWrapper.getBoundingClientRect();
+    const w = rect.width;
+    const h = rect.height;
+
+    const createdLines = [];
+
+    for (let i = 1; i < count; i++) {
+      const line = document.createElement("div");
+      line.classList.add("cut-line", "auto-page-line", orient);
+
+      if (orient === "horizontal-line") {
+        line.style.top = (h * i / count) + "px";
+        line.style.left = "0";
+        makeLineInteractive(line, true);
+      } else {
+        line.style.left = (w * i / count) + "px";
+        line.style.top = "0";
+        makeLineInteractive(line, false);
+      }
+
+      viewerWrapper.appendChild(line);
+      createdLines.push(line);
+    }
+    if (selectFirstLine && createdLines.length) {
+      setSelectedLine(createdLines[0]);
+    }
+    schedulePreviewUpdate();
+    return true;
+  }
+
+  /* 自动等分 */
+  autoSplitBtn.addEventListener("click", () => {
+    performAutoSplit(true);
+  });
+
+  clearAutoSplitBtn.addEventListener("click", () => {
+    viewerWrapper.querySelectorAll(".auto-page-line").forEach(l => l.remove());
+    schedulePreviewUpdate();
+  });
+  autoSplitOrientation.addEventListener("change", () => {
+    updateMicroAdjustVisibility();
+  });
+  updateMicroAdjustVisibility();
+
+  /* 微调按钮 */
+  function moveSelected(dx, dy) {
+    if (!selectedLine) {
+      alert("请先选中一条分割线");
+      return;
+    }
+
+    const rect = viewerWrapper.getBoundingClientRect();
+    const isHorizontal = selectedLine.classList.contains("horizontal-line");
+    const isVertical   = selectedLine.classList.contains("vertical-line");
+
+    if (dy !== 0 && !isHorizontal) {
+      alert("上下移动仅对横线有效（上下分割）");
+      return;
+    }
+    if (dx !== 0 && !isVertical) {
+      alert("左右移动仅对竖线有效（左右分割）");
+      return;
+    }
+
+    if (isHorizontal) {
+      let top = parseFloat(selectedLine.style.top) || 0;
+      top += dy;
+      top = Math.max(0, Math.min(rect.height, top));
+      selectedLine.style.top = top + "px";
+    }
+    if (isVertical) {
+      let left = parseFloat(selectedLine.style.left) || 0;
+      left += dx;
+      left = Math.max(0, Math.min(rect.width, left));
+      selectedLine.style.left = left + "px";
+    }
+    schedulePreviewUpdate();
+  }
+
+  moveUpBtn.addEventListener("click",    () => moveSelected(0, -MOVE_STEP));
+  moveDownBtn.addEventListener("click",  () => moveSelected(0,  MOVE_STEP));
+  moveLeftBtn.addEventListener("click",  () => moveSelected(-MOVE_STEP, 0));
+  moveRightBtn.addEventListener("click", () => moveSelected( MOVE_STEP, 0));
+
+  trimAreasBtn.addEventListener("click", async () => {
+    if (!srcDoc) {
+      alert("请先选择 PDF 文件");
+      return;
+    }
+    if (!lastDomSegments.length) {
+      alert("请先通过分割线生成预览，并勾选要删除的区域。");
+      return;
+    }
+    const checked = Array.from(segmentList.querySelectorAll('input[type="checkbox"]:checked'))
+      .map(input => parseInt(input.value, 10))
+      .filter(idx => Number.isFinite(idx));
+    if (checked.length === 0) {
+      alert("请勾选需要删除的区域。");
+      return;
+    }
+    if (checked.length >= lastDomSegments.length) {
+      alert("至少需要保留一个区域。");
+      return;
+    }
+
+    const deleteSet = new Set(checked);
+    const keptSegmentsRaw = lastDomSegments.filter(seg => !deleteSet.has(seg.index));
+    try {
+      const outDoc = await buildSegmentedPdf(lastDomSegments, lastDomType, index => !deleteSet.has(index));
+      const trimmedBytes = await outDoc.save();
+      const trimmedBlob = new Blob([trimmedBytes], { type: "application/pdf" });
+
+      if (currentObjectURL) URL.revokeObjectURL(currentObjectURL);
+      currentObjectURL = URL.createObjectURL(trimmedBlob);
+      pdfViewer.src = currentObjectURL;
+
+      const bufferSlice = trimmedBytes.buffer.slice(
+        trimmedBytes.byteOffset,
+        trimmedBytes.byteOffset + trimmedBytes.byteLength
+      );
+      currentPdfBytes = bufferSlice;
+      srcDoc = await PDFLib.PDFDocument.load(trimmedBytes);
+
+      splitPreview.src = "";
+      if (lastPreviewUrl) {
+        URL.revokeObjectURL(lastPreviewUrl);
+        lastPreviewUrl = null;
+      }
+
+      lastDomSegments = keptSegmentsRaw.map((seg, idx) => ({
+        index: idx,
+        startRatio: seg.startRatio,
+        endRatio: seg.endRatio
+      }));
+
+      resetSegmentOptions();
+      viewerWrapper.querySelectorAll(".cut-line").forEach(l => l.remove());
+      setSelectedLine(null);
+
+      autoSplitCount.value = String(Math.max(2, lastDomSegments.length));
+      performAutoSplit(true);
+
+      fileInfo.textContent = currentFile
+        ? `已选择：${currentFile.name}（已裁剪）`
+        : "已加载裁剪后的 PDF";
+    } catch (err) {
+      console.error(err);
+      alert("裁剪区域时出错，请查看控制台。");
+    }
+  });
+
+  /* 预览更新节流（避免拖动时疯狂重算） */
+  function schedulePreviewUpdate() {
+    if (!srcDoc) return;
+    if (previewUpdateTimer) clearTimeout(previewUpdateTimer);
+    previewUpdateTimer = setTimeout(() => {
+      previewUpdateTimer = null;
+      updateSplitPreview();
+    }, 200);  // 200ms 内的操作合并一次
+  }
+
+  /* 根据当前分割线实时生成右侧预览 PDF */
+  async function updateSplitPreview() {
+    if (!srcDoc) {
+      if (lastPreviewUrl) splitPreview.src = "";
+      resetSegmentOptions();
+      return;
+    }
+
+    const domLines = Array.from(viewerWrapper.querySelectorAll(".cut-line"));
+    if (domLines.length === 0) {
+      if (lastPreviewUrl) splitPreview.src = "";
+      resetSegmentOptions();
+      return;
+    }
+
+    const horizontals = domLines.filter(l => l.classList.contains("horizontal-line"));
+    const verticals   = domLines.filter(l => l.classList.contains("vertical-line"));
+
+    if (horizontals.length > 0 && verticals.length > 0) {
+      alert("当前仅支持一类线条切割，请保留全部横线或全部竖线。");
+      resetSegmentOptions();
+      return;
+    }
+
+    const rect = viewerWrapper.getBoundingClientRect();
+    if (!rect.width || !rect.height) {
+      alert("无法获取预览区域尺寸。");
+      resetSegmentOptions();
+      return;
+    }
+
+    const normalizedHorizontals = horizontals.map(line => ({
+      ratio: clamp01((parseFloat(line.style.top) || 0) / rect.height)
+    }));
+    const normalizedVerticals = verticals.map(line => ({
+      ratio: clamp01((parseFloat(line.style.left) || 0) / rect.width)
+    }));
+
+    const domType = normalizedVerticals.length > 0 ? "vertical" : "horizontal";
+    const relevantLines = domType === "vertical" ? normalizedVerticals : normalizedHorizontals;
+    if (relevantLines.length === 0) {
+      if (lastPreviewUrl) splitPreview.src = "";
+      resetSegmentOptions();
+      return;
+    }
+
+    const segments = buildDomSegments(relevantLines);
+    if (!segments.length) {
+      if (lastPreviewUrl) splitPreview.src = "";
+      resetSegmentOptions();
+      return;
+    }
+
+    lastDomType = domType;
+    lastDomSegments = segments;
+    renderSegmentOptions(domType, segments);
+
+    try {
+      const outDoc = await buildSegmentedPdf(segments, domType);
+      const pdfBytes = await outDoc.save();
+      const blob = new Blob([pdfBytes], { type: "application/pdf" });
+
+      if (lastPreviewUrl) URL.revokeObjectURL(lastPreviewUrl);
+      lastPreviewUrl = URL.createObjectURL(blob);
+      splitPreview.src = lastPreviewUrl;
+    } catch (err) {
+      console.error(err);
+      alert("生成预览时出错，请查看控制台。");
+    }
+  }
+
+  /* 下载当前预览 */
+  downloadBtn.addEventListener("click", () => {
+    if (!lastPreviewUrl) {
+      alert("当前还没有生成预览，请先添加分割线。");
+      return;
+    }
+    const a = document.createElement("a");
+    a.href = lastPreviewUrl;
+    a.download = "split_preview.pdf";
+    document.body.appendChild(a);
+    a.click();
+    a.remove();
+  });
+
+})();
+</script>
+
+</body>
+</html>
